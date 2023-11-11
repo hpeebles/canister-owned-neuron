@@ -1,9 +1,11 @@
 use candid::{CandidType, Principal};
-use ic_cdk::{api, init, post_upgrade, pre_upgrade, storage, update};
+use ic_cdk::api::management_canister::ecdsa::{
+    EcdsaCurve, EcdsaKeyId, EcdsaPublicKeyArgument, SignWithEcdsaArgument,
+};
+use ic_cdk::{init, post_upgrade, pre_upgrade, storage, update};
 use ic_ledger_types::{AccountIdentifier, Subaccount, DEFAULT_SUBACCOUNT};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::str::FromStr;
 
 thread_local! {
     static KEY_ID: RefCell<EcdsaKeyId> = RefCell::new(EcdsaKeyIds::TestKeyLocalDevelopment.to_key_id());
@@ -17,7 +19,7 @@ struct StableState {
 #[pre_upgrade]
 fn pre_upgrade() {
     let state = StableState {
-        key_id: KEY_ID.with(|k| k.borrow().clone()),
+        key_id: KEY_ID.with_borrow(|k| k.clone()),
     };
     storage::stable_save((state,)).unwrap();
 }
@@ -25,9 +27,7 @@ fn pre_upgrade() {
 #[post_upgrade]
 fn post_upgrade() {
     let (s,): (StableState,) = storage::stable_restore().unwrap();
-    KEY_ID.with(|k| {
-        *k.borrow_mut() = s.key_id;
-    });
+    KEY_ID.set(s.key_id);
 }
 
 #[derive(CandidType, Serialize, Debug)]
@@ -45,45 +45,6 @@ struct SignatureReply {
     pub signature: Vec<u8>,
 }
 
-type CanisterId = Principal;
-
-#[derive(CandidType, Serialize, Debug)]
-struct ECDSAPublicKey {
-    pub canister_id: Option<CanisterId>,
-    pub derivation_path: Vec<Vec<u8>>,
-    pub key_id: EcdsaKeyId,
-}
-
-#[derive(CandidType, Deserialize, Debug)]
-struct ECDSAPublicKeyReply {
-    pub public_key: Vec<u8>,
-    pub chain_code: Vec<u8>,
-}
-
-#[derive(CandidType, Serialize, Debug)]
-struct SignWithECDSA {
-    pub message_hash: Vec<u8>,
-    pub derivation_path: Vec<Vec<u8>>,
-    pub key_id: EcdsaKeyId,
-}
-
-#[derive(CandidType, Deserialize, Debug)]
-struct SignWithECDSAReply {
-    pub signature: Vec<u8>,
-}
-
-#[derive(CandidType, Deserialize, Serialize, Debug, Clone)]
-struct EcdsaKeyId {
-    pub curve: EcdsaCurve,
-    pub name: String,
-}
-
-#[derive(CandidType, Deserialize, Serialize, Debug, Clone)]
-pub enum EcdsaCurve {
-    #[serde(rename = "secp256k1")]
-    Secp256k1,
-}
-
 #[derive(CandidType, Deserialize, Serialize, Debug, Clone)]
 struct InitArgs {
     pub key_id: String,
@@ -92,10 +53,7 @@ struct InitArgs {
 #[init]
 async fn init(args: InitArgs) {
     let parsed_key_id: EcdsaKeyId = EcdsaKeyIds::try_from(args.key_id).unwrap().to_key_id();
-    KEY_ID.with(|key| {
-        let mut k = key.borrow_mut();
-        *k = parsed_key_id;
-    });
+    KEY_ID.set(parsed_key_id);
 }
 
 #[update]
@@ -126,19 +84,14 @@ async fn public_key() -> Result<PublicKeyReply, String> {
 async fn sign(message: Vec<u8>) -> Result<SignatureReply, String> {
     assert!(message.len() == 32);
 
-    let request = SignWithECDSA {
+    let request = SignWithEcdsaArgument {
         message_hash: message.clone(),
         derivation_path: derivation_path(),
         key_id: key_id(),
     };
-    let (res,): (SignWithECDSAReply,) = api::call::call_with_payment(
-        mgmt_canister_id(),
-        "sign_with_ecdsa",
-        (request,),
-        25_000_000_000,
-    )
-    .await
-    .map_err(|e| format!("Failed to call sign_with_ecdsa {}", e.1))?;
+    let (res,) = ic_cdk::api::management_canister::ecdsa::sign_with_ecdsa(request)
+        .await
+        .map_err(|e| format!("Failed to call sign_with_ecdsa {}", e.1))?;
 
     Ok(SignatureReply {
         signature: res.signature,
@@ -146,15 +99,11 @@ async fn sign(message: Vec<u8>) -> Result<SignatureReply, String> {
 }
 
 fn key_id() -> EcdsaKeyId {
-    KEY_ID.with(|k| k.borrow().clone())
+    KEY_ID.with_borrow(|k| k.clone())
 }
 
 fn derivation_path() -> Vec<Vec<u8>> {
     vec![]
-}
-
-fn mgmt_canister_id() -> CanisterId {
-    CanisterId::from_str("aaaaa-aa").unwrap()
 }
 
 enum EcdsaKeyIds {
@@ -199,15 +148,14 @@ impl TryFrom<String> for EcdsaKeyIds {
 }
 
 async fn get_public_key() -> Result<Vec<u8>, String> {
-    let request = ECDSAPublicKey {
+    let request = EcdsaPublicKeyArgument {
         canister_id: None,
         derivation_path: derivation_path(),
         key_id: key_id(),
     };
-    let (res,): (ECDSAPublicKeyReply,) =
-        ic_cdk::call(mgmt_canister_id(), "ecdsa_public_key", (request,))
-            .await
-            .map_err(|e| format!("Failed to call ecdsa_public_key {}", e.1))?;
+    let (res,) = ic_cdk::api::management_canister::ecdsa::ecdsa_public_key(request)
+        .await
+        .map_err(|e| format!("Failed to call ecdsa_public_key {}", e.1))?;
 
     Ok(res.public_key)
 }
